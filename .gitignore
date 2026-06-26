@@ -9,6 +9,7 @@ venv/
 logs/
 *.csv
 *.png
+!docs/discharge_graph.png
 *.pdf
 .env
 .eggs/

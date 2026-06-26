@@ -122,6 +122,8 @@ Start Voltage     : 13.0 V  →  End: 0.4 V
 Avg Temperature   : 46 °C
 ```
 
+![Discharge Graph](docs/discharge_graph.png)
+
 ## License
 
 MIT
