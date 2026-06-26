@@ -1,0 +1,6 @@
+bleak>=0.21
+rich>=13.0
+pyyaml>=6.0
+fastapi>=0.100
+uvicorn>=0.22
+aiohttp>=3.9

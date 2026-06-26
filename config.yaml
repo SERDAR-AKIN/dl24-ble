@@ -1,0 +1,12 @@
+dl24:
+  device_name: "DL24_BLE"
+  device_address: ""
+  scan_timeout: 5.0
+  ble_interface: "hci0"
+  reconnect: true
+  reconnect_delay: 2.0
+  data_format: "csv"
+  output_dir: "./logs"
+  web_host: "0.0.0.0"
+  web_port: 9090
+  log_level: "INFO"
