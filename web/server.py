@@ -1,4 +1,4 @@
-"""FastAPI server with WebSocket, recording, and report download."""
+"""FastAPI server with WebSocket, recording, report download, and reference template."""
 
 import asyncio
 import csv
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from dl24_ble import DL24Device, DL24Config, Measurement, Command
@@ -21,6 +21,74 @@ logger = logging.getLogger(__name__)
 
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(exist_ok=True)
+
+# ── Reference template (healthy battery baseline) ──────────────────────
+REFERENCE_CSV_FILE = "dl24_20260629_123707.csv"
+
+_reference_template_cache: Optional[dict] = None
+
+
+def _parse_runtime_to_seconds(runtime_str: str) -> int:
+    try:
+        parts = runtime_str.strip().split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        return 0
+    except (ValueError, AttributeError):
+        return 0
+
+
+def build_reference_template() -> dict:
+    global _reference_template_cache
+    if _reference_template_cache is not None:
+        return _reference_template_cache
+
+    fpath = LOG_DIR / REFERENCE_CSV_FILE
+    if not fpath.exists():
+        logger.warning(f"Reference CSV not found: {fpath}")
+        return {"time_sec": [], "voltage_min": [], "voltage_max": [],
+                "capacity_min": [], "capacity_max": [],
+                "source_files": [], "max_runtime_sec": 0}
+
+    times, volts, caps = [], [], []
+    with open(fpath, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            t = _parse_runtime_to_seconds(row.get("runtime", "0"))
+            v = float(row.get("voltage_V", 0))
+            c = float(row.get("capacity_Ah", 0))
+            times.append(t)
+            volts.append(v)
+            caps.append(c)
+
+    if not times:
+        return {"time_sec": [], "voltage_min": [], "voltage_max": [],
+                "capacity_min": [], "capacity_max": [],
+                "source_files": [], "max_runtime_sec": 0}
+
+    # Normalize capacity to start from 0
+    cap_offset = caps[0]
+    caps = [c - cap_offset for c in caps]
+
+    voltage_min = [round(v * 0.95, 3) for v in volts]
+    voltage_max = [round(v * 1.05, 3) for v in volts]
+    capacity_min = [round(c * 0.95, 4) for c in caps]
+    capacity_max = [round(c * 1.05, 4) for c in caps]
+
+    name = REFERENCE_CSV_FILE.replace("dl24_", "").replace(".csv", "")
+    _reference_template_cache = {
+        "time_sec": times,
+        "voltage_min": voltage_min,
+        "voltage_max": voltage_max,
+        "capacity_min": capacity_min,
+        "capacity_max": capacity_max,
+        "source_files": [name],
+        "max_runtime_sec": times[-1],
+    }
+    return _reference_template_cache
+
 
 device: Optional[DL24Device] = None
 device_lock = asyncio.Lock()
@@ -150,6 +218,8 @@ async def websocket_endpoint(ws: WebSocket):
             }))
             if latest_measurement:
                 await ws.send_text(json.dumps(latest_measurement.to_dict() | {"recording": recording}))
+            template = build_reference_template()
+            await ws.send_text(json.dumps({"type": "reference_template", "template": template}))
         except (WebSocketDisconnect, RuntimeError):
             return
     except RuntimeError as e:
@@ -237,6 +307,10 @@ async def handle_ws_message(ws: WebSocket, msg: str):
         if device:
             await device.send_command(cmd_map[cmd])
 
+    elif cmd == "load_template":
+        template = build_reference_template()
+        await ws.send_text(json.dumps({"type": "reference_template", "template": template}))
+
 
 async def _stop_and_report():
     global recording, csv_file, csv_writer
@@ -292,6 +366,12 @@ async def download_file(filename: str):
     if path.exists():
         return FileResponse(path, media_type="text/csv", filename=filename)
     return {"error": "not found"}
+
+
+@app.get("/api/reference-template")
+async def get_reference_template():
+    template = build_reference_template()
+    return JSONResponse(template)
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -370,6 +450,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .btn:disabled { opacity: 0.4; cursor: default; }
 
   .filename { font-size: 0.75rem; color: var(--dim); }
+
+  .template-controls {
+    display: flex; gap: 10px; padding: 8px 24px; align-items: center; flex-wrap: wrap;
+    background: var(--card); border-top: 1px solid var(--border);
+  }
+  .template-controls .label { font-size: 0.72rem; color: var(--dim); white-space: nowrap; }
+  .shift-slider {
+    -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px;
+    background: var(--border); outline: none; width: 160px; cursor: pointer;
+  }
+  .shift-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+    border-radius: 50%; background: var(--accent); cursor: pointer;
+  }
+  .shift-value { font-size: 0.75rem; color: var(--accent); min-width: 55px; text-align: center; font-family: monospace; }
+  .template-toggle { font-size: 0.75rem; color: var(--dim); cursor: pointer; user-select: none; }
+  .template-toggle.active { color: var(--accent); }
+  .template-toggle input { display: none; }
 
   #log-bar {
     padding: 6px 24px; background: var(--card);
@@ -463,6 +561,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="graph-section"><div id="graph"></div></div>
 
+<div class="template-controls" id="template-controls" style="display:none">
+  <label class="template-toggle active" id="tpl-toggle-label">
+    <input type="checkbox" id="tpl-toggle" checked onchange="toggleTemplate()">
+    👻 Sağlıklı Referans
+  </label>
+  <span class="label">Zaman Kaydırma:</span>
+  <input type="range" class="shift-slider" id="shift-slider" min="-600" max="600" value="0" step="10"
+         oninput="onShiftChange(this.value)">
+  <span class="shift-value" id="shift-val">0 sn</span>
+  <button class="btn" onclick="resetShift()" style="padding:3px 8px;font-size:0.7rem;">↺ Sıfırla</button>
+</div>
+
 <div class="controls">
   <button class="btn primary" id="btn-record" onclick="toggleRecord()">⏺ Kaydı Başlat</button>
   <button class="btn" id="btn-download" onclick="downloadLog()" disabled>⬇ CSV İndir</button>
@@ -473,24 +583,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const MAX_POINTS = 600;
-let timestamps = [], volts = [], amps = [], ahs = [];
+let timestamps = [], volts = [], ahs = [];
 let connected = false;
 let recording = false;
 let ws = null, reconnectDelay = 1000;
 let csvFilename = '';
 
-function toggleConnect() {
-  if (connected) {
-    sendCmd('disconnect');
-  } else {
-    sendCmd('connect');
-  }
+// ── Reference template state ──
+let templateData = null;
+let templateVisible = true;
+let templateShiftSec = 0;
+let testStartWallclock = null;
+let templateDirty = false;
+
+function parseRuntime(r) {
+  if (!r) return 0;
+  const p = r.split(':');
+  return parseInt(p[0])*3600 + parseInt(p[1])*60 + parseInt(p[2]);
 }
 
-function toggleRecord() {
-  sendCmd('record_toggle');
+function fmtShift(sec) {
+  const m = Math.floor(Math.abs(sec)/60), s = Math.abs(sec)%60;
+  const sign = sec < 0 ? '-' : sec > 0 ? '+' : '';
+  return sign + m + ':' + String(s).padStart(2,'0') + ' dk';
 }
+
+function toggleConnect() {
+  if (connected) { sendCmd('disconnect'); } else { sendCmd('connect'); }
+}
+
+function toggleRecord() { sendCmd('record_toggle'); }
 
 function downloadLog() {
   if (csvFilename) window.open('/download/' + csvFilename, '_blank');
@@ -512,11 +634,11 @@ function updateUI(m) {
 }
 
 function updateRecording(rec, path) {
+  const wasRecording = recording;
   recording = rec;
   const btn = document.getElementById('btn-record');
   const dot = document.getElementById('rec-dot');
   const dl = document.getElementById('btn-download');
-
   if (rec) {
     btn.textContent = '⏹ Kaydı Durdur';
     btn.classList.add('recording');
@@ -527,6 +649,7 @@ function updateRecording(rec, path) {
       csvFilename = path.split('/').pop();
       document.getElementById('csv-name').textContent = '📁 ' + csvFilename;
     }
+    if (!wasRecording) resetGraph();
   } else {
     btn.textContent = '⏺ Kaydı Başlat';
     btn.classList.remove('recording');
@@ -558,50 +681,131 @@ function setConnected(ok, addr, err) {
   document.getElementById('status-dot').className = 'status-dot ' + (ok ? 'on' : 'off');
   document.getElementById('status-text').textContent = ok ? ('Cihaza bağlı — ' + (addr||'')) : (err || 'Bağlı değil');
   const btn = document.getElementById('btn-connect');
-  if (ok) {
-    btn.textContent = '⚡ Bağlantıyı Kes';
-    btn.className = 'btn danger';
-  } else {
-    btn.textContent = '🔗 Cihaza Bağlan';
-    btn.className = 'btn primary';
-  }
+  if (ok) { btn.textContent = '⚡ Bağlantıyı Kes'; btn.className = 'btn danger'; }
+  else { btn.textContent = '🔗 Cihaza Bağlan'; btn.className = 'btn primary'; }
   btn.style.display = 'inline-block';
 }
 
 function addLog(msg) {
   const el = document.getElementById('log-text');
-  el.textContent = msg;
-  el.className = '';
+  el.textContent = msg; el.className = '';
   if (msg.includes('bağlandı') || msg.includes('kesildi')) el.className = 'log-ok';
   else if (msg.includes('Hata') || msg.includes('bulunamadı')) el.className = 'log-error';
 }
 
 function initGraph() {
   Plotly.newPlot('graph', [
-    { y: [], x: [], name: 'Voltaj (V)', type: 'scatter', mode: 'lines',
-      line: { color: '#4488ff', width: 1.5 }, yaxis: 'y' },
-    { y: [], x: [], name: 'Kapasite (Ah)', type: 'scatter', mode: 'lines',
-      line: { color: '#ffaa00', width: 1.5, dash: 'dot' }, yaxis: 'y2' },
+    { y:[], x:[], name:'Voltaj (V)', type:'scatter', mode:'lines',
+      line:{color:'#4488ff', width:1.5}, yaxis:'y' },
+    { y:[], x:[], name:'Kapasite (Ah)', type:'scatter', mode:'lines',
+      line:{color:'#ffaa00', width:1.5, dash:'dot'}, yaxis:'y2' },
+    { y:[], x:[], name:'Sağlıklı Ref V', type:'scatter', mode:'lines',
+      line:{color:'rgba(68,136,255,0.35)', width:0.5}, yaxis:'y',
+      showlegend:false, hoverinfo:'skip' },
+    { y:[], x:[], name:'Ref Voltaj (V)', type:'scatter', mode:'lines',
+      line:{color:'rgba(68,136,255,0.35)', width:0.5}, yaxis:'y',
+      fill:'tonexty', fillcolor:'rgba(68,136,255,0.10)' },
+    { y:[], x:[], name:'Sağlıklı Ref C', type:'scatter', mode:'lines',
+      line:{color:'rgba(255,170,0,0.35)', width:0.5}, yaxis:'y2',
+      showlegend:false, hoverinfo:'skip' },
+    { y:[], x:[], name:'Ref Kapasite (Ah)', type:'scatter', mode:'lines',
+      line:{color:'rgba(255,170,0,0.35)', width:0.5}, yaxis:'y2',
+      fill:'tonexty', fillcolor:'rgba(255,170,0,0.10)' },
   ], {
-    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
-    font: { color: '#8888aa', size: 11 },
-    margin: { t: 10, r: 60, b: 40, l: 50 },
-    xaxis: { title: 'Zaman', gridcolor: '#1a1a30', zeroline: false },
-    yaxis: { title: 'Voltaj (V)', gridcolor: '#1a1a30', side: 'left' },
-    yaxis2: { title: 'Kapasite (Ah)', overlaying: 'y', side: 'right', gridcolor: 'rgba(0,0,0,0)' },
-    legend: { orientation: 'h', y: 1.12 },
-  }, { responsive: true, displayModeBar: false });
+    paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+    font:{color:'#8888aa', size:11},
+    margin:{t:10, r:60, b:40, l:50},
+    xaxis:{title:'Zaman', gridcolor:'#1a1a30', zeroline:false},
+    yaxis:{title:'Voltaj (V)', gridcolor:'#1a1a30', side:'left', range:[9,14]},
+    yaxis2:{title:'Kapasite (Ah)', overlaying:'y', side:'right', gridcolor:'rgba(0,0,0,0)'},
+    legend:{orientation:'h', y:1.12},
+  }, {responsive:true, displayModeBar:false});
+}
+
+function applyTemplate() {
+  if (!templateData || !templateData.time_sec.length) return;
+  document.getElementById('template-controls').style.display = 'flex';
+
+  const shift = templateShiftSec;
+  const t0 = testStartWallclock ? testStartWallclock.getTime() : Date.now();
+  const timeSec = templateData.time_sec;
+  const n = timeSec.length;
+
+  const xVals = new Array(n);
+  for (let i = 0; i < n; i++) {
+    xVals[i] = new Date(t0 + (timeSec[i] + shift) * 1000);
+  }
+
+  const vis = templateVisible;
+
+  Plotly.update('graph',
+    { x: [null, null, xVals, xVals, xVals, xVals],
+      y: [null, null, templateData.voltage_min, templateData.voltage_max,
+                  templateData.capacity_min, templateData.capacity_max] },
+    {}, [0,1,2,3,4,5]);
+
+  for (let i = 2; i <= 5; i++) {
+    Plotly.restyle('graph', {visible: vis ? true : 'legendonly'}, [i]);
+  }
+}
+
+function onTemplateReceived(data) {
+  templateData = data;
+  templateDirty = true;
+  if (templateData.source_files) {
+    document.getElementById('tpl-toggle-label').childNodes[1].textContent =
+      ' 👻 Sağlıklı Referans (±%5)';
+  }
+  applyTemplate();
+}
+
+function toggleTemplate() {
+  templateVisible = document.getElementById('tpl-toggle').checked;
+  const label = document.getElementById('tpl-toggle-label');
+  label.className = 'template-toggle' + (templateVisible ? ' active' : '');
+  templateDirty = true;
+  applyTemplate();
+}
+
+function onShiftChange(val) {
+  templateShiftSec = parseInt(val);
+  document.getElementById('shift-val').textContent = fmtShift(templateShiftSec);
+  templateDirty = true;
+  applyTemplate();
+}
+
+function resetShift() {
+  templateShiftSec = 0;
+  document.getElementById('shift-slider').value = 0;
+  document.getElementById('shift-val').textContent = '0 sn';
+  templateDirty = true;
+  applyTemplate();
+}
+
+function resetGraph() {
+  timestamps = []; volts = []; ahs = [];
+  testStartWallclock = null;
+  templateDirty = true;
+  Plotly.update('graph', {x:[[],[]], y:[[],[]]}, {}, [0,1]);
 }
 
 function updateGraph(m) {
   const now = new Date();
-  timestamps.push(now); volts.push(m.voltage||0); ahs.push(m.capacity_ah||0);
-  if (timestamps.length > MAX_POINTS) {
-    timestamps = timestamps.slice(-MAX_POINTS);
-    volts = volts.slice(-MAX_POINTS);
-    ahs = ahs.slice(-MAX_POINTS);
+
+  if (testStartWallclock === null && m.runtime) {
+    const rt = parseRuntime(m.runtime);
+    testStartWallclock = new Date(now.getTime() - rt * 1000);
+    templateDirty = true;
   }
-  Plotly.update('graph', { x: [timestamps, timestamps], y: [volts, ahs] }, {}, [0, 1]);
+
+  timestamps.push(now); volts.push(m.voltage||0); ahs.push(m.capacity_ah||0);
+
+  Plotly.update('graph', {x:[timestamps,timestamps], y:[volts,ahs]}, {}, [0,1]);
+
+  if (templateData && templateDirty) {
+    applyTemplate();
+    templateDirty = false;
+  }
 }
 
 function connect() {
@@ -610,7 +814,9 @@ function connect() {
   ws.onmessage = (e) => {
     try {
       const d = JSON.parse(e.data);
-      if (d.type === 'status_log') {
+      if (d.type === 'reference_template') {
+        onTemplateReceived(d.template);
+      } else if (d.type === 'status_log') {
         addLog(d.message);
       } else if (d.type === 'status') {
         setConnected(d.connected, d.address||'', d.error||'');
