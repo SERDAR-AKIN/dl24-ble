@@ -41,11 +41,17 @@ async def get_or_create_device() -> DL24Device:
             if device:
                 try: await device.disconnect()
                 except: pass
+
+            await broadcast({"type": "status_log", "message": "Bluetooth cihaz taranıyor..."})
             device = DL24Device()
             device.on_measurement(on_device_measurement)
             ok = await device.connect()
             if not ok:
+                await broadcast({"type": "status_log", "message": "Cihaz bulunamadı. Tekrar denemek için 🔗 Cihaza Bağlan butonuna tıklayın."})
                 raise RuntimeError("Could not connect to DL24 device")
+
+            addr = device.address
+            await broadcast({"type": "status_log", "message": f"Cihaza bağlandı — {addr}"})
     return device
 
 
@@ -137,7 +143,9 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients.add(ws)
 
+    # Try BLE connect but keep WS alive on failure so user can retry
     try:
+        await broadcast({"type": "status_log", "message": "Web sayfası bağlandı, Bluetooth cihaz taranıyor..."})
         d = await get_or_create_device()
         await asyncio.sleep(0.5)
         await ws.send_text(json.dumps({
@@ -146,7 +154,15 @@ async def websocket_endpoint(ws: WebSocket):
         }))
         if latest_measurement:
             await ws.send_text(json.dumps(latest_measurement.to_dict() | {"recording": recording}))
+    except RuntimeError as e:
+        await broadcast({"type": "status_log", "message": f"Hata: {e}"})
+        await ws.send_text(json.dumps({
+            "type": "status", "connected": False,
+            "recording": recording, "path": str(csv_path) if csv_path else "",
+            "error": str(e),
+        }))
 
+    try:
         while True:
             try:
                 msg = await asyncio.wait_for(ws.receive_text(), timeout=30)
@@ -172,7 +188,36 @@ async def handle_ws_message(ws: WebSocket, msg: str):
 
     cmd = data.get("command")
 
-    if cmd == "record_toggle":
+    if cmd == "connect":
+        try:
+            await broadcast({"type": "status_log", "message": "Bluetooth cihaz taranıyor..."})
+            d = await get_or_create_device()
+            await broadcast({
+                "type": "status", "connected": True, "address": d.address,
+                "recording": recording, "path": str(csv_path) if csv_path else "",
+            })
+            if latest_measurement:
+                await broadcast(latest_measurement.to_dict() | {"recording": recording})
+        except RuntimeError as e:
+            await ws.send_text(json.dumps({
+                "type": "status", "connected": False,
+                "recording": recording, "path": str(csv_path) if csv_path else "",
+                "error": str(e),
+            }))
+
+    elif cmd == "disconnect":
+        global device
+        async with device_lock:
+            if device:
+                await device.disconnect()
+                device = None
+        await broadcast({"type": "status_log", "message": "Cihaz bağlantısı kesildi."})
+        await broadcast({
+            "type": "status", "connected": False,
+            "recording": recording, "path": str(csv_path) if csv_path else "",
+        })
+
+    elif cmd == "record_toggle":
         if recording:
             await _stop_and_report()
         else:
@@ -317,6 +362,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   .filename { font-size: 0.75rem; color: var(--dim); }
 
+  #log-bar {
+    padding: 6px 24px; background: var(--card);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.75rem; font-family: 'SF Mono', 'Consolas', monospace;
+    color: var(--dim); min-height: 28px;
+    display: flex; align-items: center; gap: 8px;
+    white-space: nowrap; overflow: hidden;
+  }
+  #log-bar .prefix { color: var(--accent); opacity: 0.6; flex-shrink: 0; }
+  #log-text {
+    overflow: hidden; text-overflow: ellipsis;
+    transition: color 0.3s;
+  }
+  #log-text.log-error { color: var(--danger); }
+  #log-text.log-ok { color: var(--accent); }
+
   @media (max-width: 700px) {
     .metrics { grid-template-columns: 1fr 1fr; }
     .metric-card .value { font-size: 1.4rem; }
@@ -333,9 +394,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <span class="filename" id="csv-name"></span>
     <span class="rec-dot status-dot" id="rec-dot" style="display:none"></span>
     <span class="status-dot off" id="status-dot"></span>
-    <span id="status-text" style="color:var(--dim)">Disconnected</span>
+    <span id="status-text" style="color:var(--dim)">Bağlı değil</span>
+    <button class="btn primary" id="btn-connect" onclick="toggleConnect()" style="display:none">🔗 Cihaza Bağlan</button>
   </div>
 </header>
+
+<div id="log-bar">
+  <span class="prefix">$</span>
+  <span id="log-text">Web sayfası yüklendi, Bluetooth bağlantısı bekleniyor...</span>
+</div>
 
 <div class="metrics">
   <div class="metric-card">
@@ -399,9 +466,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const MAX_POINTS = 600;
 let timestamps = [], volts = [], amps = [], ahs = [];
+let connected = false;
 let recording = false;
 let ws = null, reconnectDelay = 1000;
 let csvFilename = '';
+
+function toggleConnect() {
+  if (connected) {
+    sendCmd('disconnect');
+  } else {
+    sendCmd('connect');
+  }
+}
 
 function toggleRecord() {
   sendCmd('record_toggle');
@@ -468,9 +544,27 @@ function showReport(report) {
   panel.style.display = 'block';
 }
 
-function setConnected(ok, addr) {
+function setConnected(ok, addr, err) {
+  connected = ok;
   document.getElementById('status-dot').className = 'status-dot ' + (ok ? 'on' : 'off');
-  document.getElementById('status-text').textContent = ok ? ('Connected — ' + (addr||'')) : 'Disconnected';
+  document.getElementById('status-text').textContent = ok ? ('Cihaza bağlı — ' + (addr||'')) : (err || 'Bağlı değil');
+  const btn = document.getElementById('btn-connect');
+  if (ok) {
+    btn.textContent = '⚡ Bağlantıyı Kes';
+    btn.className = 'btn danger';
+  } else {
+    btn.textContent = '🔗 Cihaza Bağlan';
+    btn.className = 'btn primary';
+  }
+  btn.style.display = 'inline-block';
+}
+
+function addLog(msg) {
+  const el = document.getElementById('log-text');
+  el.textContent = msg;
+  el.className = '';
+  if (msg.includes('bağlandı') || msg.includes('kesildi')) el.className = 'log-ok';
+  else if (msg.includes('Hata') || msg.includes('bulunamadı')) el.className = 'log-error';
 }
 
 function initGraph() {
@@ -507,14 +601,16 @@ function connect() {
   ws.onmessage = (e) => {
     try {
       const d = JSON.parse(e.data);
-      if (d.type === 'status') {
-        setConnected(d.connected, d.address||'');
+      if (d.type === 'status_log') {
+        addLog(d.message);
+      } else if (d.type === 'status') {
+        setConnected(d.connected, d.address||'', d.error||'');
         if (d.recording !== undefined) updateRecording(d.recording, d.path);
       } else if (d.type === 'record_status') {
         updateRecording(d.recording, d.path);
         if (d.report) showReport(d.report);
       } else if (d.type === 'error') {
-        // silently handled
+        setConnected(false, '', d.message);
       } else if (d.type !== 'ping') {
         updateUI(d);
         updateGraph(d);
