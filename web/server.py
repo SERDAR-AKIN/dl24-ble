@@ -109,13 +109,8 @@ def on_device_measurement(m: Measurement):
         test_start_v = m.voltage
 
     data = json.dumps(m.to_dict() | {"recording": recording})
-    dead = set()
     for ws in clients:
-        try:
-            asyncio.create_task(ws.send_text(data))
-        except Exception:
-            dead.add(ws)
-    clients.difference_update(dead)
+        asyncio.create_task(_ws_send(ws, data))
 
 
 @asynccontextmanager
@@ -148,19 +143,25 @@ async def websocket_endpoint(ws: WebSocket):
         await broadcast({"type": "status_log", "message": "Web sayfası bağlandı, Bluetooth cihaz taranıyor..."})
         d = await get_or_create_device()
         await asyncio.sleep(0.5)
-        await ws.send_text(json.dumps({
-            "type": "status", "connected": True, "address": d.address,
-            "recording": recording, "path": str(csv_path) if csv_path else "",
-        }))
-        if latest_measurement:
-            await ws.send_text(json.dumps(latest_measurement.to_dict() | {"recording": recording}))
+        try:
+            await ws.send_text(json.dumps({
+                "type": "status", "connected": True, "address": d.address,
+                "recording": recording, "path": str(csv_path) if csv_path else "",
+            }))
+            if latest_measurement:
+                await ws.send_text(json.dumps(latest_measurement.to_dict() | {"recording": recording}))
+        except WebSocketDisconnect:
+            return
     except RuntimeError as e:
         await broadcast({"type": "status_log", "message": f"Hata: {e}"})
-        await ws.send_text(json.dumps({
-            "type": "status", "connected": False,
-            "recording": recording, "path": str(csv_path) if csv_path else "",
-            "error": str(e),
-        }))
+        try:
+            await ws.send_text(json.dumps({
+                "type": "status", "connected": False,
+                "recording": recording, "path": str(csv_path) if csv_path else "",
+                "error": str(e),
+            }))
+        except WebSocketDisconnect:
+            pass
 
     try:
         while True:
@@ -168,7 +169,10 @@ async def websocket_endpoint(ws: WebSocket):
                 msg = await asyncio.wait_for(ws.receive_text(), timeout=30)
                 await handle_ws_message(ws, msg)
             except asyncio.TimeoutError:
-                await ws.send_text(json.dumps({"type": "ping"}))
+                try:
+                    await ws.send_text(json.dumps({"type": "ping"}))
+                except WebSocketDisconnect:
+                    raise
     except WebSocketDisconnect:
         pass
     except RuntimeError as e:
@@ -199,11 +203,14 @@ async def handle_ws_message(ws: WebSocket, msg: str):
             if latest_measurement:
                 await broadcast(latest_measurement.to_dict() | {"recording": recording})
         except RuntimeError as e:
-            await ws.send_text(json.dumps({
-                "type": "status", "connected": False,
-                "recording": recording, "path": str(csv_path) if csv_path else "",
-                "error": str(e),
-            }))
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "status", "connected": False,
+                    "recording": recording, "path": str(csv_path) if csv_path else "",
+                    "error": str(e),
+                }))
+            except WebSocketDisconnect:
+                pass
 
     elif cmd == "disconnect":
         global device
@@ -275,6 +282,13 @@ async def broadcast(payload: dict):
         except Exception:
             dead.add(ws)
     clients.difference_update(dead)
+
+
+async def _ws_send(ws: WebSocket, data: str):
+    try:
+        await ws.send_text(data)
+    except Exception:
+        pass
 
 
 @app.get("/download/{filename}")
