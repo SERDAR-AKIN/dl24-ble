@@ -150,7 +150,7 @@ async def websocket_endpoint(ws: WebSocket):
             }))
             if latest_measurement:
                 await ws.send_text(json.dumps(latest_measurement.to_dict() | {"recording": recording}))
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
             return
     except RuntimeError as e:
         await broadcast({"type": "status_log", "message": f"Hata: {e}"})
@@ -160,7 +160,7 @@ async def websocket_endpoint(ws: WebSocket):
                 "recording": recording, "path": str(csv_path) if csv_path else "",
                 "error": str(e),
             }))
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
             pass
 
     try:
@@ -171,15 +171,10 @@ async def websocket_endpoint(ws: WebSocket):
             except asyncio.TimeoutError:
                 try:
                     await ws.send_text(json.dumps({"type": "ping"}))
-                except WebSocketDisconnect:
+                except (WebSocketDisconnect, RuntimeError):
                     raise
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
-    except RuntimeError as e:
-        try:
-            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
-        except WebSocketDisconnect:
-            pass
     finally:
         clients.discard(ws)
 
@@ -209,7 +204,7 @@ async def handle_ws_message(ws: WebSocket, msg: str):
                     "recording": recording, "path": str(csv_path) if csv_path else "",
                     "error": str(e),
                 }))
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 pass
 
     elif cmd == "disconnect":
